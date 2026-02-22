@@ -1,5 +1,5 @@
 # Athlete_FP
-This is an individual athlete dashboard to identify trends over a longitudinal timeline. Nomenclature for metrics are from VALD systems.
+This is an individual athlete dashboard to identify countermovement jump trends over a longitudinal timeline. Nomenclature for metrics are from VALD systems. Claude Sonnet 4.6 was utilized to create this code.
 
 # Force Plate Longitudinal Monitoring Dashboard
 **Athlete:** MA (anonymized) · **Device:** ForceDecks (VALD) · **Test:** CMJ only  

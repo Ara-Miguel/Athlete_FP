@@ -80,7 +80,7 @@ Peak concentric force normalised to body mass (N/kg). Normalising removes sessio
 ### CMJ Stiffness — Every Rep
 Leg spring stiffness during the countermovement (N/m) — the ratio of peak GRF to peak CoM displacement. Higher stiffness = more efficient elastic energy storage. Sensitive to neuromuscular fatigue. Season range: 5,123–6,657 N/m. **r = +0.597** vs jump height (p < 0.001).
 
-### eRFD vs Jump Height — All Reps · Coloured by Phase
+### eRFD vs Jump Height — All Reps · Colored by Phase
 Cross-sectional scatter: eRFD on X, jump height on Y. Filled circles = best reps; open circles = other reps. Shows that high eRFD co-occurs with high jump height on the same rep, not just over time.
 
 ---
@@ -178,7 +178,7 @@ Export to CSV or Excel via the Buttons extension. The hidden `date_sort` column 
 | `COL_PAPER` | `#faf8f3` | Plot and page background |
 | `COL_BORDER` | `#ccc9c0` | Grid lines |
 
-All colours are defined as named constants in the setup chunk. No hex literals appear in the chart layer.
+All colors are defined as named constants in the setup chunk. No hex literals appear in the chart layer.
 
 ---
 

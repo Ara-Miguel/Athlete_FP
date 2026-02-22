@@ -1,0 +1,1036 @@
+---
+title: "Force Plate — Individual Longitudinal Monitoring"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: scroll
+    self_contained: true
+    navbar:
+      - { title: "MA · CMJ · 60 Reps · 32 Sessions · Apr–Sep 2025", align: left }
+---
+
+```{r setup, include=FALSE}
+# =============================================================================
+# MA LONGITUDINAL FORCE PLATE DASHBOARD
+# =============================================================================
+# Athlete  : MA (anonymized)
+# Device   : ForceDecks (VALD)
+# Test     : CMJ only
+# Data     : Individual rep level — NOT session-averaged
+#            Best rep per session flagged; all reps plotted individually
+# Sessions : 32 unique test dates, Apr 10 – Sep 8, 2025
+# Reps     : 60 total (1–3 per session)
+# =============================================================================
+
+library(flexdashboard)
+library(tidyverse)
+library(DT)
+library(plotly)
+
+# ── Path setup ────────────────────────────────────────────────────────────────
+# Option A (simplest): Session → Set Working Directory → To Source File Location
+#   DATA_PATH <- "ma_force_plate.csv"
+#
+# Option B — absolute path:
+DATA_PATH <- "/Users/aramimac/Desktop/Force Plate - Trends/MA_FP/ma_force_plate.csv"  # ← update to your local path
+#
+# Option C — project-relative (recommended inside an RStudio Project):
+#   library(here)
+#   DATA_PATH <- here("data", "ma_force_plate.csv")
+
+DATA_PATH <- "ma_force_plate.csv"  # ← update as needed
+
+# ── Load and validate ─────────────────────────────────────────────────────────
+df_raw <- read_csv(DATA_PATH, show_col_types = FALSE)
+
+# Input validation: catch wrong file, missing columns, or empty data early —
+# before errors surface deep inside plot chunks with no useful context.
+required_cols <- c(
+  "Date", "Name", "session_num", "rep_num", "is_best_rep", "month_label",
+  "test_type", "bw_kg", "Reps", "jump_height_cm", "jump_height_in",
+  "rsi_mod", "ecc_rfd", "cmj_stiffness", "cpf_bm", "cpf_n", "conc_velocity",
+  "braking_dur_ms", "cm_depth", "flight_time_ms", "force_at_peak_power",
+  "conc_impulse_50ms", "conc_impulse_100ms", "conc_rfd_50ms", "conc_rfd_100ms",
+  "takeoff_pf_bm", "cpf_l", "cpf_r", "takeoff_l", "takeoff_r",
+  "asym_concentric_pct", "asym_takeoff_pct", "asym_abs_pct"
+)
+missing_cols <- setdiff(required_cols, names(df_raw))
+if (length(missing_cols) > 0) {
+  stop("CSV is missing expected columns: ", paste(missing_cols, collapse = ", "),
+       "
+Check that DATA_PATH points to the correct ma_force_plate.csv file.")
+}
+if (nrow(df_raw) == 0) {
+  stop("CSV loaded with zero rows — check DATA_PATH.")
+}
+
+# Filter to CMJ only — dashboard is scoped to CMJ exclusively.
+# The cleaning script is future-proofed for multiple test types; this filter
+# ensures the dashboard stays correct if future exports add SJ, IMTP, etc.
+df <- df_raw |>
+  filter(test_type == "CMJ") |>
+  mutate(
+    Date        = as.Date(Date),
+    is_best_rep = as.logical(is_best_rep),
+    # month_label: re-derive factor levels from sorted dates so chronological
+    # order is guaranteed regardless of CSV row order on read.
+    month_label = factor(
+      format(as.Date(Date), "%b %Y"),
+      levels = unique(format(sort(as.Date(Date)), "%b %Y"))
+    )
+  )
+
+if (nrow(df) == 0) {
+  stop("No CMJ rows found after filtering. Check the test_type column in the CSV. Values found: ", paste(unique(df_raw$test_type), collapse = ", "))
+}
+
+# ── Palette (mirrors OBP suite) ───────────────────────────────────────────────
+COL_INK    <- "#1a1a18"
+COL_PAPER  <- "#faf8f3"
+COL_BORDER <- "#ccc9c0"
+COL_MUTED  <- "#555550"
+COL_ALL    <- "#2563a8"   # blue  — all reps
+COL_BEST   <- "#1a6b3c"   # green — best rep per session
+COL_WARN   <- "#c07a1a"   # amber — reference line
+COL_NEG     <- "#c0392b"   # red     — decline / right limb
+COL_IMPULSE <- "#7b2d8b"   # purple  — impulse metrics (corr-summary)
+
+# ── Season phases ─────────────────────────────────────────────────────────────
+# Season phases: 3 bands map cleanly to the actual season structure.
+# "Peak" (Jul 15–31) held only 1 session with 2 reps — a single session
+# cannot constitute a meaningful phase category on any chart. Collapsed
+# into Mid Season (Jun–Jul), giving three balanced, interpretable bands:
+#   Early Season : Apr–May  (14 sessions, 30 reps)
+#   Mid Season   : Jun–Jul  (10 sessions, 20 reps, includes peak performance date)
+#   Late Season  : Aug–Sep  ( 8 sessions, 10 reps)
+df <- df |>
+  mutate(phase = case_when(
+    Date < as.Date("2025-06-01") ~ "Early Season",
+    Date < as.Date("2025-08-01") ~ "Mid Season",
+    TRUE                         ~ "Late Season"
+  ),
+  phase = factor(phase, levels = c("Early Season","Mid Season","Late Season")))
+
+PHASE_COLS <- c(
+  "Early Season" = "#2563a8",   # blue
+  "Mid Season"   = "#1a6b3c",   # green
+  "Late Season"  = "#c0392b"    # red
+)
+
+# ── Convenience subsets ───────────────────────────────────────────────────────
+# best_reps : one (or occasionally two, if tied) per session — used for trend lines
+# other_reps: non-best reps only; single-rep sessions have NO row here — those
+#             sessions appear exclusively in the best_reps trace
+best_reps  <- df |> filter(is_best_rep)
+other_reps <- df |> filter(!is_best_rep)
+
+# n_reps_per_session: authoritative rep count per session derived from data.
+# Used in hover text instead of the raw 'Reps' column, which is an internal
+# ForceDecks per-row counter that does not reliably equal session rep totals.
+df <- df |>
+  group_by(session_num) |>
+  mutate(n_reps_session = n()) |>
+  ungroup()
+
+# Rebuild subsets after adding n_reps_session
+best_reps  <- df |> filter(is_best_rep)
+other_reps <- df |> filter(!is_best_rep)
+
+# ── Key derived stats ─────────────────────────────────────────────────────────
+n_sessions   <- n_distinct(df$Date)     # used in subtitle annotations
+n_reps_total <- nrow(df)                # used in subtitle annotations
+date_first   <- min(df$Date)
+date_last    <- max(df$Date)
+
+peak_jh      <- max(df$jump_height_cm, na.rm = TRUE)
+# which() on the full logical vector detects ties and takes the first occurrence
+# explicitly — consistent with the cleaning script's Step 16 tie-safe logic.
+peak_jh_idx  <- which(df$jump_height_cm == peak_jh)
+peak_jh_date <- df$Date[peak_jh_idx[1]]
+first_jh     <- best_reps |> filter(Date == date_first) |> pull(jump_height_cm) |> max()
+last_jh      <- best_reps |> filter(Date == date_last)  |> pull(jump_height_cm) |> max()
+chg_jh       <- round(last_jh - first_jh, 2)
+
+first_rsi    <- best_reps |> filter(Date == date_first) |> pull(rsi_mod) |> max()
+last_rsi     <- best_reps |> filter(Date == date_last)  |> pull(rsi_mod) |> max()
+chg_rsi      <- round(last_rsi - first_rsi, 3)
+```
+
+```{css, echo=FALSE}
+body, .dashboard-container {
+  background-color: #faf8f3 !important;
+  font-family: Arial, Calibri, sans-serif !important;
+  color: #1a1a18 !important;
+}
+.navbar {
+  background-color: #1a1a18 !important;
+  border-bottom: 3px solid #2563a8 !important;
+}
+.navbar-brand, .navbar-nav li a {
+  font-size: 11px !important;
+  letter-spacing: 2px !important;
+  text-transform: uppercase !important;
+  color: #cccccc !important;
+}
+.chart-wrapper, .chart-stage {
+  background-color: #faf8f3 !important;
+}
+.section-label {
+  font-size: 12px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: #555550;
+  padding-top: 10px;
+  margin-bottom: 10px;
+  font-family: Arial, Calibri, sans-serif;
+  font-weight: 600;
+}
+.section-label::before { content: "// "; color: #2563a8; }
+table.dataTable thead th {
+  background-color: #1a1a18 !important;
+  color: #f0eeea !important;
+  font-size: 11px !important;
+  letter-spacing: 1.5px !important;
+  text-transform: uppercase !important;
+  font-weight: 600 !important;
+  font-family: Arial, Calibri, sans-serif !important;
+  padding: 10px 8px !important;
+}
+table.dataTable tbody td {
+  background-color: #faf8f3 !important;
+  color: #1a1a18 !important;
+  font-size: 12px !important;
+  font-family: Arial, Calibri, sans-serif !important;
+  border-bottom: 1px solid #dedad2 !important;
+  padding: 8px !important;
+}
+table.dataTable tbody tr:nth-child(even) td { background-color: #f2f0eb !important; }
+table.dataTable tbody tr:hover td { background-color: #e8e5de !important; }
+.dataTables_wrapper {
+  background: #ede9e1 !important;
+  padding: 16px !important;
+  border: 1px solid #ccc9c0 !important;
+}
+.dataTables_filter label,
+.dataTables_length label,
+.dataTables_info,
+.dataTables_paginate {
+  color: #333330 !important;
+  font-size: 12px !important;
+  font-family: Arial, Calibri, sans-serif !important;
+}
+.paginate_button { color: #333330 !important; }
+```
+
+Season Overview
+=====================================
+
+Row {data-height=520}
+-------------------------------------
+
+### <span class="section-label">Jump Height — Every Rep · Best Rep per Session Connected</span>
+
+```{r jh-timeline, fig.width=9, fig.height=5}
+plot_ly() |>
+  add_trace(
+    data = other_reps,
+    x = ~Date, y = ~jump_height_cm,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_ALL, opacity = 0.35),
+    text = ~sprintf("Date: %s<br>Rep %d of %d<br>Jump Height: %.1f cm<br>RSI: %.2f m/s",
+                    format(Date, "%b %d"), rep_num, n_reps_session, jump_height_cm, rsi_mod),
+    hoverinfo = "text",
+    name = "Other reps",
+    showlegend = TRUE
+  ) |>
+  add_trace(
+    data = best_reps,
+    x = ~Date, y = ~jump_height_cm,
+    type = "scatter", mode = "markers",
+    marker = list(size = 10, color = COL_BEST, opacity = 0.95,
+                  line = list(color = COL_INK, width = 1)),
+    text = ~sprintf("Date: %s<br>Session %d — Best Rep<br>Jump Height: %.1f cm<br>RSI: %.2f m/s<br>eRFD: %.0f N/s",
+                    format(Date, "%b %d"), session_num, jump_height_cm, rsi_mod, ecc_rfd),
+    hoverinfo = "text",
+    name = "Best rep / session",
+    legendgroup = "best", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = {
+      d <- best_reps; d$dn <- as.numeric(d$Date)
+      lo <- loess(jump_height_cm ~ dn, data = d, span = 0.5)
+      sd <- seq(min(d$Date), max(d$Date), by = "day")
+      data.frame(Date = sd, y = predict(lo, newdata = data.frame(dn = as.numeric(sd))))
+    },
+    x = ~Date, y = ~y,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_BEST, width = 2),
+    hoverinfo = "skip", name = "Best rep / session",
+    legendgroup = "best", showlegend = FALSE
+  ) |>
+  add_annotations(
+    x = peak_jh_date, y = peak_jh + 1.5,
+    text = sprintf("Season high<br>%.1f cm", peak_jh),
+    showarrow = TRUE, arrowhead = 2, arrowsize = 0.8, arrowcolor = COL_INK,
+    font = list(size = 10, color = COL_INK),
+    xref = "x", yref = "y"
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                 tickformat = "%b %d"),
+    yaxis = list(title = "Jump Height (cm)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = sprintf("%d sessions · %d reps · Season high %.1f cm (%s) · First\u2192Last best rep: %+.1f cm",
+                     n_sessions, n_reps_total, peak_jh, format(peak_jh_date, "%b %d"), chg_jh),
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">RSI-Modified — Every Rep · Season Trajectory</span>
+
+```{r rsi-timeline, fig.width=9, fig.height=5}
+plot_ly() |>
+  add_trace(
+    data = other_reps,
+    x = ~Date, y = ~rsi_mod,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_ALL, opacity = 0.35),
+    text = ~sprintf("Date: %s<br>Rep %d<br>RSI: %.2f m/s<br>JH: %.1f cm",
+                    format(Date, "%b %d"), rep_num, rsi_mod, jump_height_cm),
+    hoverinfo = "text", name = "Other reps", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = best_reps,
+    x = ~Date, y = ~rsi_mod,
+    type = "scatter", mode = "markers",
+    marker = list(size = 10, color = COL_BEST, opacity = 0.95,
+                  line = list(color = COL_INK, width = 1)),
+    text = ~sprintf("Date: %s<br>Session %d — Best Rep<br>RSI: %.2f m/s<br>JH: %.1f cm",
+                    format(Date, "%b %d"), session_num, rsi_mod, jump_height_cm),
+    hoverinfo = "text", name = "Best rep / session",
+    legendgroup = "bestr", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = {
+      d <- best_reps; d$dn <- as.numeric(d$Date)
+      lo <- loess(rsi_mod ~ dn, data = d, span = 0.5)
+      sd <- seq(min(d$Date), max(d$Date), by = "day")
+      data.frame(Date = sd, y = predict(lo, newdata = data.frame(dn = as.numeric(sd))))
+    },
+    x = ~Date, y = ~y,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_BEST, width = 2),
+    hoverinfo = "skip", name = "Best rep / session",
+    legendgroup = "bestr", showlegend = FALSE
+  ) |>
+  add_segments(
+    x = min(df$Date), xend = max(df$Date), y = 0.75, yend = 0.75,
+    line = list(color = COL_WARN, width = 1.5, dash = "dash"),
+    name = "0.75 m/s reference", showlegend = TRUE
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                 tickformat = "%b %d"),
+    yaxis = list(title = "RSI-Modified (m/s)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = sprintf("First→Last best rep: %+.3f m/s | Dashed line = 0.75 m/s reference",
+                     chg_rsi),
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+Row {data-height=480}
+-------------------------------------
+
+### <span class="section-label">Jump Height Distribution by Month</span>
+
+```{r monthly-box, fig.width=6, fig.height=5}
+plot_ly(df,
+        x = ~month_label, y = ~jump_height_cm,
+        color = ~phase, colors = PHASE_COLS,
+        type = "box", boxpoints = "all",
+        jitter = 0.3, pointpos = 0,
+        marker = list(size = 6, opacity = 0.75),
+        line = list(width = 1.5),
+        text = ~sprintf("Date: %s<br>Rep %d<br>%.1f cm%s",
+                        format(Date, "%b %d"), rep_num, jump_height_cm,
+                        if_else(is_best_rep, " \u2605 Best", "")),
+        hoverinfo = "text",
+        showlegend = TRUE) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Jump Height (cm)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.11, font = list(size = 11),
+                  title = list(text = "Phase")),
+    annotations = list(list(
+      x = 0, y = 1.04, xref = "paper", yref = "paper",
+      text = "Every dot is one rep — hover to see session and rep details",
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">Phase Summary — Best Rep Stats</span>
+
+```{r phase-summary}
+phase_summary <- best_reps |>
+  group_by(Phase = phase) |>
+  summarise(
+    Sessions       = n_distinct(Date),
+    `Best JH (cm)` = round(max(jump_height_cm), 1),
+    `Mean JH (cm)` = round(mean(jump_height_cm), 1),
+    `Best RSI`     = round(max(rsi_mod), 2),
+    `Mean RSI`     = round(mean(rsi_mod), 2),
+    `Mean eRFD`    = round(mean(ecc_rfd), 0),
+    .groups = "drop"
+  )
+
+datatable(phase_summary,
+          options = list(dom = "t", pageLength = 10, ordering = FALSE),
+          rownames = FALSE,
+          class = "compact stripe") |>
+  formatStyle(columns = 1:7,
+              backgroundColor = "#faf8f3", color = "#1a1a18", fontSize = "12px")
+```
+
+Trajectories
+=====================================
+
+Row {data-height=520}
+-------------------------------------
+
+### <span class="section-label">Eccentric RFD — Every Rep · Season Trajectory</span>
+
+```{r erfd-timeline, fig.width=9, fig.height=5}
+plot_ly() |>
+  add_trace(
+    data = other_reps,
+    x = ~Date, y = ~ecc_rfd,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_ALL, opacity = 0.35),
+    text = ~sprintf("Date: %s<br>Rep %d<br>eRFD: %.0f N/s<br>JH: %.1f cm",
+                    format(Date, "%b %d"), rep_num, ecc_rfd, jump_height_cm),
+    hoverinfo = "text", name = "Other reps", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = best_reps,
+    x = ~Date, y = ~ecc_rfd,
+    type = "scatter", mode = "markers",
+    marker = list(size = 10, color = COL_BEST, opacity = 0.95,
+                  line = list(color = COL_INK, width = 1)),
+    text = ~sprintf("Date: %s<br>Session %d — Best Rep<br>eRFD: %.0f N/s<br>JH: %.1f cm",
+                    format(Date, "%b %d"), session_num, ecc_rfd, jump_height_cm),
+    hoverinfo = "text", name = "Best rep / session",
+    legendgroup = "beste", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = {
+      d <- best_reps; d$dn <- as.numeric(d$Date)
+      lo <- loess(ecc_rfd ~ dn, data = d, span = 0.5)
+      sd <- seq(min(d$Date), max(d$Date), by = "day")
+      data.frame(Date = sd, y = predict(lo, newdata = data.frame(dn = as.numeric(sd))))
+    },
+    x = ~Date, y = ~y,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_BEST, width = 2),
+    hoverinfo = "skip", name = "Best rep / session",
+    legendgroup = "beste", showlegend = FALSE
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                 tickformat = "%b %d"),
+    yaxis = list(title = "Eccentric Braking RFD (N/s)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = "How fast force develops during the loading phase — reflects reactive ability and neural drive",
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">Concentric Peak Force / BM — Every Rep</span>
+
+```{r cpf-timeline, fig.width=9, fig.height=5}
+plot_ly() |>
+  add_trace(
+    data = other_reps,
+    x = ~Date, y = ~cpf_bm,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_ALL, opacity = 0.35),
+    text = ~sprintf("Date: %s<br>Rep %d<br>CPF/BM: %.1f N/kg<br>JH: %.1f cm",
+                    format(Date, "%b %d"), rep_num, cpf_bm, jump_height_cm),
+    hoverinfo = "text", name = "Other reps", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = best_reps,
+    x = ~Date, y = ~cpf_bm,
+    type = "scatter", mode = "markers",
+    marker = list(size = 10, color = COL_BEST, opacity = 0.95,
+                  line = list(color = COL_INK, width = 1)),
+    text = ~sprintf("Date: %s<br>Session %d — Best Rep<br>CPF/BM: %.1f N/kg<br>JH: %.1f cm",
+                    format(Date, "%b %d"), session_num, cpf_bm, jump_height_cm),
+    hoverinfo = "text", name = "Best rep / session",
+    legendgroup = "bestc", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = {
+      d <- best_reps; d$dn <- as.numeric(d$Date)
+      lo <- loess(cpf_bm ~ dn, data = d, span = 0.5)
+      sd <- seq(min(d$Date), max(d$Date), by = "day")
+      data.frame(Date = sd, y = predict(lo, newdata = data.frame(dn = as.numeric(sd))))
+    },
+    x = ~Date, y = ~y,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_BEST, width = 2),
+    hoverinfo = "skip", name = "Best rep / session",
+    legendgroup = "bestc", showlegend = FALSE
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                 tickformat = "%b %d"),
+    yaxis = list(title = "Concentric Peak Force / BM (N/kg)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = "Concentric force relative to body mass — normalised for athlete size; higher = greater relative power",
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+Row {data-height=520}
+-------------------------------------
+
+### <span class="section-label">CMJ Stiffness — Every Rep</span>
+
+```{r stiff-timeline, fig.width=9, fig.height=5}
+plot_ly() |>
+  add_trace(
+    data = other_reps,
+    x = ~Date, y = ~cmj_stiffness,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_ALL, opacity = 0.35),
+    text = ~sprintf("Date: %s<br>Rep %d<br>Stiffness: %.0f N/m<br>JH: %.1f cm",
+                    format(Date, "%b %d"), rep_num, cmj_stiffness, jump_height_cm),
+    hoverinfo = "text", name = "Other reps", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = best_reps,
+    x = ~Date, y = ~cmj_stiffness,
+    type = "scatter", mode = "markers",
+    marker = list(size = 10, color = COL_BEST, opacity = 0.95,
+                  line = list(color = COL_INK, width = 1)),
+    text = ~sprintf("Date: %s<br>Session %d — Best Rep<br>Stiffness: %.0f N/m<br>JH: %.1f cm",
+                    format(Date, "%b %d"), session_num, cmj_stiffness, jump_height_cm),
+    hoverinfo = "text", name = "Best rep / session",
+    legendgroup = "bests", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = {
+      d <- best_reps; d$dn <- as.numeric(d$Date)
+      lo <- loess(cmj_stiffness ~ dn, data = d, span = 0.5)
+      sd <- seq(min(d$Date), max(d$Date), by = "day")
+      data.frame(Date = sd, y = predict(lo, newdata = data.frame(dn = as.numeric(sd))))
+    },
+    x = ~Date, y = ~y,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_BEST, width = 2),
+    hoverinfo = "skip", name = "Best rep / session",
+    legendgroup = "bests", showlegend = FALSE
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                 tickformat = "%b %d"),
+    yaxis = list(title = "CMJ Stiffness (N/m)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = "Leg spring stiffness during the countermovement — higher stiffness = more elastic energy storage",
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">eRFD vs Jump Height — All Reps · Colored by Phase</span>
+
+```{r erfd-jh-scatter, fig.width=9, fig.height=5}
+r_val <- cor(df$ecc_rfd, df$jump_height_cm, use = "complete.obs")
+
+plot_ly(df,
+        x = ~ecc_rfd, y = ~jump_height_cm,
+        color = ~phase, colors = PHASE_COLS,
+        symbol = ~if_else(is_best_rep, "circle", "circle-open"),
+        type = "scatter", mode = "markers",
+        marker = list(size = 8, opacity = 0.8),
+        text = ~sprintf("Date: %s<br>Rep %d%s<br>eRFD: %.0f N/s<br>JH: %.1f cm",
+                        format(Date, "%b %d"), rep_num,
+                        if_else(is_best_rep, " \u2605", ""), ecc_rfd, jump_height_cm),
+        hoverinfo = "text") |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "Eccentric RFD (N/s)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Jump Height (cm)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(font = list(size = 11), title = list(text = "Phase")),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = sprintf("r = %.3f across all %d reps | filled circle = best rep of session",
+                     r_val, n_reps_total),
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+Asymmetry
+=====================================
+
+Row {data-height=520}
+-------------------------------------
+
+### <span class="section-label">Concentric Asymmetry (L vs R) — Every Rep · ±10% Threshold</span>
+
+```{r asym-timeline, fig.width=9, fig.height=5}
+pct_above <- round(mean(abs(df$asym_concentric_pct) > 10, na.rm = TRUE) * 100, 1)
+mean_asym <- round(mean(abs(df$asym_concentric_pct), na.rm = TRUE), 1)
+
+plot_ly() |>
+  add_segments(x = min(df$Date), xend = max(df$Date), y =  10, yend =  10,
+               line = list(color = COL_NEG, width = 1.5, dash = "dash"),
+               name = "+10% threshold", showlegend = TRUE) |>
+  add_segments(x = min(df$Date), xend = max(df$Date), y = -10, yend = -10,
+               line = list(color = COL_NEG, width = 1.5, dash = "dash"),
+               showlegend = FALSE) |>
+  add_segments(x = min(df$Date), xend = max(df$Date), y = 0, yend = 0,
+               line = list(color = COL_MUTED, width = 1, dash = "dot"),
+               name = "Symmetry", showlegend = TRUE) |>
+  add_trace(
+    data = df,
+    x = ~Date, y = ~asym_concentric_pct,
+    type = "scatter", mode = "markers",
+    color = ~phase, colors = PHASE_COLS,
+    marker = list(size = 8, opacity = 0.8),
+    text = ~sprintf("Date: %s<br>Rep %d<br>Asymmetry: %+.1f%%<br>L: %.0f N | R: %.0f N",
+                    format(Date, "%b %d"), rep_num, asym_concentric_pct, cpf_l, cpf_r),
+    hoverinfo = "text",
+    name = ~as.character(phase)
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                 tickformat = "%b %d"),
+    yaxis = list(title = "Asymmetry % (positive = left dominant)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = sprintf("Mean absolute asymmetry: %.1f%% | %.0f%% of reps exceed the \u00b110%% threshold",
+                     mean_asym, pct_above),
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">Left vs Right Concentric Peak Force — All Reps</span>
+
+```{r lr-scatter, fig.width=9, fig.height=5}
+force_min <- min(c(df$cpf_l, df$cpf_r), na.rm = TRUE) * 0.97
+force_max <- max(c(df$cpf_l, df$cpf_r), na.rm = TRUE) * 1.03
+
+plot_ly() |>
+  add_trace(
+    x = c(force_min, force_max), y = c(force_min, force_max),
+    type = "scatter", mode = "lines",
+    line = list(color = COL_MUTED, width = 1.5, dash = "dash"),
+    name = "Perfect symmetry", showlegend = TRUE
+  ) |>
+  add_trace(
+    data = df,
+    x = ~cpf_l, y = ~cpf_r,
+    type = "scatter", mode = "markers",
+    color = ~phase, colors = PHASE_COLS,
+    marker = list(size = 8, opacity = 0.75),
+    text = ~sprintf("Date: %s<br>Rep %d<br>L: %.0f N | R: %.0f N<br>Asym: %+.1f%%",
+                    format(Date, "%b %d"), rep_num, cpf_l, cpf_r, asym_concentric_pct),
+    hoverinfo = "text",
+    name = ~as.character(phase)
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "Left Concentric Peak Force (N)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Right Concentric Peak Force (N)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11))
+  )
+```
+
+Row {data-height=440}
+-------------------------------------
+
+### <span class="section-label">Asymmetry Distribution by Phase</span>
+
+```{r asym-box, fig.width=6, fig.height=4}
+plot_ly(df,
+        x = ~phase, y = ~asym_abs_pct,
+        color = ~phase, colors = PHASE_COLS,
+        type = "box", boxpoints = "all",
+        jitter = 0.3, pointpos = 0,
+        marker = list(size = 6, opacity = 0.75),
+        line = list(width = 1.5),
+        text = ~sprintf("Date: %s<br>Rep %d<br>Abs asymmetry: %.1f%%",
+                        format(Date, "%b %d"), rep_num, asym_abs_pct),
+        hoverinfo = "text",
+        showlegend = FALSE) |>
+  add_segments(x = 0.5, xend = 3.5, y = 10, yend = 10,
+               line = list(color = COL_NEG, width = 1.5, dash = "dash"),
+               showlegend = FALSE) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Absolute Asymmetry (%)", gridcolor = COL_BORDER, linecolor = COL_BORDER)
+  )
+```
+
+### <span class="section-label">L/R Force — Monthly Means</span>
+
+```{r lr-monthly, fig.width=6, fig.height=4}
+lr_monthly <- df |>
+  group_by(month_label) |>
+  summarise(L = mean(cpf_l, na.rm = TRUE),
+            R = mean(cpf_r, na.rm = TRUE),
+            .groups = "drop")
+
+plot_ly(lr_monthly) |>
+  add_trace(x = ~month_label, y = ~L, type = "bar", name = "Left",
+            marker = list(color = COL_ALL, opacity = 0.85),
+            text = ~sprintf("Left: %.0f N", L), hoverinfo = "text") |>
+  add_trace(x = ~month_label, y = ~R, type = "bar", name = "Right",
+            marker = list(color = COL_NEG, opacity = 0.85),
+            text = ~sprintf("Right: %.0f N", R), hoverinfo = "text") |>
+  layout(
+    barmode = "group",
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Mean Concentric Peak Force (N)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(font = list(size = 11))
+  )
+```
+
+Impulse Correlation
+=====================================
+
+Row {data-height=540}
+-------------------------------------
+
+### <span class="section-label">Concentric Impulse 50ms vs Jump Height — All Reps · Colored by Phase</span>
+
+```{r impulse-50-jh, fig.width=9, fig.height=5}
+r_50 <- cor(df$conc_impulse_50ms, df$jump_height_cm, use = "complete.obs")
+
+plot_ly(df,
+        x = ~conc_impulse_50ms, y = ~jump_height_cm,
+        color = ~phase, colors = PHASE_COLS,
+        symbol = ~if_else(is_best_rep, "circle", "circle-open"),
+        type = "scatter", mode = "markers",
+        marker = list(size = 8, opacity = 0.8),
+        text = ~sprintf("Date: %s<br>Rep %d%s<br>Impulse 50ms: %.1f N\u00b7s<br>JH: %.1f cm",
+                        format(Date, "%b %d"), rep_num,
+                        if_else(is_best_rep, " \u2605", ""),
+                        conc_impulse_50ms, jump_height_cm),
+        hoverinfo = "text") |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "Concentric Impulse — 50ms (N\u00b7s)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Jump Height (cm)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(font = list(size = 11), title = list(text = "Phase")),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = sprintf("r = %.3f | Impulse in the first 50ms of the concentric push vs jump outcome",
+                     r_50),
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">Concentric Impulse 100ms vs Jump Height — All Reps · Colored by Phase</span>
+
+```{r impulse-100-jh, fig.width=9, fig.height=5}
+r_100 <- cor(df$conc_impulse_100ms, df$jump_height_cm, use = "complete.obs")
+
+plot_ly(df,
+        x = ~conc_impulse_100ms, y = ~jump_height_cm,
+        color = ~phase, colors = PHASE_COLS,
+        symbol = ~if_else(is_best_rep, "circle", "circle-open"),
+        type = "scatter", mode = "markers",
+        marker = list(size = 8, opacity = 0.8),
+        text = ~sprintf("Date: %s<br>Rep %d%s<br>Impulse 100ms: %.1f N\u00b7s<br>JH: %.1f cm",
+                        format(Date, "%b %d"), rep_num,
+                        if_else(is_best_rep, " \u2605", ""),
+                        conc_impulse_100ms, jump_height_cm),
+        hoverinfo = "text") |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "Concentric Impulse — 100ms (N\u00b7s)",
+                 gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    yaxis = list(title = "Jump Height (cm)", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    legend = list(font = list(size = 11), title = list(text = "Phase")),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = sprintf("r = %.3f | Impulse in the first 100ms vs jump outcome — strongest early-phase predictor",
+                     r_100),
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+Row {data-height=520}
+-------------------------------------
+
+### <span class="section-label">Impulse 50ms & 100ms — Season Trajectory · Both Windows</span>
+
+```{r impulse-timeline, fig.width=9, fig.height=5}
+# LOESS smooth for each impulse window — spans the full date range
+date_num <- as.numeric(df$Date)
+
+loess_50  <- loess(conc_impulse_50ms  ~ date_num, data = df, span = 0.45)
+loess_100 <- loess(conc_impulse_100ms ~ date_num, data = df, span = 0.45)
+
+smooth_dates <- seq(min(df$Date), max(df$Date), by = "day")
+smooth_x     <- as.numeric(smooth_dates)
+
+smooth_df <- tibble(
+  Date     = smooth_dates,
+  s50      = predict(loess_50,  newdata = data.frame(date_num = smooth_x)),
+  s100     = predict(loess_100, newdata = data.frame(date_num = smooth_x))
+)
+
+plot_ly() |>
+  # 50ms raw reps
+  add_trace(
+    data = df,
+    x = ~Date, y = ~conc_impulse_50ms,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_ALL, opacity = 0.55),
+    yaxis = "y1",
+    text = ~sprintf("Date: %s<br>Rep %d<br>50ms: %.1f N\u00b7s",
+                    format(Date, "%b %d"), rep_num, conc_impulse_50ms),
+    hoverinfo = "text", name = "Impulse 50ms",
+    legendgroup = "imp50", showlegend = TRUE
+  ) |>
+  # 50ms LOESS trend — same legendgroup, so clicking "Impulse 50ms" hides this too
+  add_trace(
+    data = smooth_df,
+    x = ~Date, y = ~s50,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_ALL, width = 2.5),
+    yaxis = "y1",
+    hoverinfo = "skip", name = "Impulse 50ms",
+    legendgroup = "imp50", showlegend = FALSE
+  ) |>
+  # 100ms raw reps
+  add_trace(
+    data = df,
+    x = ~Date, y = ~conc_impulse_100ms,
+    type = "scatter", mode = "markers",
+    marker = list(size = 7, color = COL_BEST, opacity = 0.55),
+    yaxis = "y2",
+    text = ~sprintf("Date: %s<br>Rep %d<br>100ms: %.1f N\u00b7s",
+                    format(Date, "%b %d"), rep_num, conc_impulse_100ms),
+    hoverinfo = "text", name = "Impulse 100ms",
+    legendgroup = "imp100", showlegend = TRUE
+  ) |>
+  # 100ms LOESS trend — same legendgroup, so clicking "Impulse 100ms" hides this too
+  add_trace(
+    data = smooth_df,
+    x = ~Date, y = ~s100,
+    type = "scatter", mode = "lines",
+    line = list(color = COL_BEST, width = 2.5),
+    yaxis = "y2",
+    hoverinfo = "skip", name = "Impulse 100ms",
+    legendgroup = "imp100", showlegend = FALSE
+  ) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis  = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER,
+                  tickformat = "%b %d"),
+    yaxis  = list(title = "50ms Impulse (N\u00b7s)", gridcolor = COL_BORDER,
+                  linecolor = COL_BORDER, side = "left"),
+    yaxis2 = list(title = "100ms Impulse (N\u00b7s)", overlaying = "y", side = "right",
+                  showgrid = FALSE, linecolor = COL_BORDER),
+    legend = list(orientation = "h", x = 0, y = 1.13, font = list(size = 11)),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = "Blue = 50ms (left axis) \u00b7 Green = 100ms (right axis) \u00b7 Solid lines = LOESS trend (span = 0.45)",
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+### <span class="section-label">Impulse Correlation Summary — All Metrics vs Jump Height</span>
+
+```{r corr-summary, fig.width=9, fig.height=5}
+# Correlation of all key metrics against jump height
+corr_metrics <- c("conc_impulse_50ms","conc_impulse_100ms","ecc_rfd",
+                  "cpf_bm","cmj_stiffness","rsi_mod","conc_rfd_50ms","conc_rfd_100ms")
+corr_labels  <- c("Conc Impulse 50ms","Conc Impulse 100ms","Eccentric RFD",
+                  "Conc Peak Force / BM","CMJ Stiffness","RSI-Modified",
+                  "Conc RFD 50ms","Conc RFD 100ms")
+
+corr_vals <- sapply(corr_metrics, function(m) {
+  cor(df[[m]], df$jump_height_cm, use = "complete.obs")
+})
+
+corr_df <- tibble(
+  metric = corr_labels,
+  r      = round(corr_vals, 3)
+) |>
+  arrange(desc(abs(r))) |>
+  mutate(
+    bar_color = case_when(
+      metric %in% c("Conc Impulse 50ms","Conc Impulse 100ms") ~ COL_IMPULSE,
+      r > 0  ~ COL_BEST,
+      TRUE   ~ COL_NEG
+    ),
+    label = sprintf("r = %+.3f", r)
+  )
+
+plot_ly(corr_df,
+        x = ~r,
+        y = ~reorder(metric, abs(r)),
+        type = "bar",
+        orientation = "h",
+        marker = list(color = ~bar_color, opacity = 0.85,
+                      line = list(color = COL_INK, width = 0.5)),
+        text = ~label,
+        textposition = "inside",
+        hoverinfo = "text",
+        showlegend = FALSE) |>
+  # Categorical Y anchors: reference the actual first and last bar labels
+  # so the zero-line segment shares the same categorical axis as the bars.
+  # Numeric y/yend (0.4, 8.6) create a second numeric axis that Plotly
+  # surfaces as stray tick labels on the Y-axis.
+  add_segments(x = 0, xend = 0,
+               y = corr_df$metric[nrow(corr_df)],
+               yend = corr_df$metric[1],
+               line = list(color = COL_MUTED, width = 1, dash = "dot"),
+               showlegend = FALSE) |>
+  layout(
+    paper_bgcolor = COL_PAPER, plot_bgcolor = COL_PAPER,
+    font = list(family = "Arial, Calibri, sans-serif", color = COL_INK, size = 12),
+    xaxis = list(title = "Pearson r vs Jump Height", gridcolor = COL_BORDER,
+                 linecolor = COL_BORDER, range = c(-1, 1.15)),
+    yaxis = list(title = "", gridcolor = COL_BORDER, linecolor = COL_BORDER),
+    margin = list(l = 160, r = 60),
+    annotations = list(list(
+      x = 0, y = 1.06, xref = "paper", yref = "paper",
+      text = "Purple = impulse metrics \u00b7 Green = positive r \u00b7 Red = negative r (note: conc RFD is negative by convention in ForceDecks)",
+      showarrow = FALSE, font = list(size = 11, color = COL_MUTED),
+      xanchor = "left"
+    ))
+  )
+```
+
+Rep Detail
+=====================================
+
+Row {data-height=700}
+-------------------------------------
+
+### <span class="section-label">All Reps — Full Season Table · Downloadable</span>
+
+```{r rep-table}
+# date_sort: hidden ISO string (YYYY-MM-DD) used as the sort key for the Date column
+# Date:      human-readable display string — would sort alphabetically on its own
+# columnDefs orderData ties column 0 (Date display) to column 1 (date_sort hidden),
+# so clicking the Date header sorts chronologically, not alphabetically
+rep_table <- df |>
+  arrange(desc(Date), rep_num) |>
+  mutate(
+    date_sort = format(Date, "%Y-%m-%d"),   # ISO — sorts correctly as text
+    Best      = if_else(is_best_rep, "\u2605", ""),
+    Date      = format(Date, "%b %d, %Y")  # display — would sort wrong on its own
+  ) |>
+  select(
+    Date,
+    date_sort,
+    `Sess`            = session_num,
+    `Rep`             = rep_num,
+    `Best`,
+    `JH (cm)`         = jump_height_cm,
+    `RSI (m/s)`       = rsi_mod,
+    `eRFD (N/s)`      = ecc_rfd,
+    `Stiffness (N/m)` = cmj_stiffness,
+    `CPF/BM (N/kg)`   = cpf_bm,
+    `CM Depth (cm)`   = cm_depth,
+    `L Force (N)`     = cpf_l,
+    `R Force (N)`     = cpf_r,
+    `Asym %`          = asym_concentric_pct,
+    `BW (kg)`         = bw_kg
+  )
+
+datatable(
+  rep_table,
+  extensions = "Buttons",
+  options = list(
+    dom        = "Bfrtip",
+    buttons    = list("csv", "excel"),
+    pageLength = 20,
+    order      = list(list(0, "desc")),  # default: newest first
+    scrollX    = TRUE,
+    columnDefs = list(
+      list(targets = 1, visible = FALSE),          # hide date_sort column
+      list(orderData = 1, targets = 0),            # Date column sorts by date_sort
+      list(className = "dt-center", targets = 2:14)
+    )
+  ),
+  rownames = FALSE,
+  class    = "compact stripe hover"
+) |>
+  formatRound(columns = c("JH (cm)","RSI (m/s)","CPF/BM (N/kg)","CM Depth (cm)","Asym %","BW (kg)"),
+              digits = 2) |>
+  formatRound(columns = c("eRFD (N/s)","Stiffness (N/m)","L Force (N)","R Force (N)"),
+              digits = 0) |>
+  formatStyle("Best", color = "#1a6b3c", fontWeight = "bold", fontSize = "14px") |>
+  formatStyle(columns = 1:15,
+              backgroundColor = "#faf8f3", color = "#1a1a18", fontSize = "12px")
+```
